@@ -1,5 +1,4 @@
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage;
 using ReliableEvents.Sample.Application.Abstractions;
 using ReliableEvents.Sample.Domain;
 
@@ -10,8 +9,24 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
-    public Task<IDbContextTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
-        => Database.BeginTransactionAsync(cancellationToken);
+    public async Task AddOrderAsync(Order order, CancellationToken cancellationToken = default)
+        => await Orders.AddAsync(order, cancellationToken);
+
+    public async Task AddOutboxMessageAsync(OutboxMessage outboxMessage, CancellationToken cancellationToken = default)
+        => await OutboxMessages.AddAsync(outboxMessage, cancellationToken);
+
+    public async Task<IReadOnlyList<OutboxMessage>> GetPendingOutboxMessagesAsync(int batchSize, CancellationToken cancellationToken = default)
+        => await OutboxMessages
+            .Where(x => x.PublishedAtUtc == null)
+            .OrderBy(x => x.OccurredAtUtc)
+            .Take(batchSize)
+            .ToListAsync(cancellationToken);
+
+    public async Task<IAppDbTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+    {
+        var transaction = await Database.BeginTransactionAsync(cancellationToken);
+        return new AppDbTransaction(transaction);
+    }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

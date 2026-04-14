@@ -1,8 +1,6 @@
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using ReliableEvents.Sample.Application.Abstractions;
 using ReliableEvents.Sample.Infrastructure.Messaging;
-using ReliableEvents.Sample.Persistence;
 
 namespace ReliableEvents.Sample.Worker.Services;
 
@@ -25,14 +23,10 @@ public sealed class OutboxPublisherWorker(
             try
             {
                 using var scope = scopeFactory.CreateScope();
-                var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                var dbContext = scope.ServiceProvider.GetRequiredService<IAppDbContext>();
                 var publisher = scope.ServiceProvider.GetRequiredService<IEventPublisher>();
 
-                var pendingMessages = await dbContext.OutboxMessages
-                    .Where(x => x.PublishedAtUtc == null)
-                    .OrderBy(x => x.OccurredAtUtc)
-                    .Take(BatchSize)
-                    .ToListAsync(stoppingToken);
+                var pendingMessages = await dbContext.GetPendingOutboxMessagesAsync(BatchSize, stoppingToken);
 
                 logger.LogInformation(
                     "Fetched outbox batch. Pending messages in batch: {PendingMessageCount}, RoutingKey: {RoutingKey}",
