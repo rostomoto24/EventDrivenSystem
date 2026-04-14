@@ -33,7 +33,7 @@ tests/
   - `POST /orders` sends `CreateOrderCommand` through MediatR.
 - **Worker**:
   - `OutboxPublisherWorker` polls unpublished outbox rows and publishes them.
-  - `SampleOrderConsumerWorker` consumes queue messages and checks Redis before processing.
+  - `SampleOrderConsumerWorker` is a hosted sample consumer for `OrderCreated` events and uses Redis idempotency keys (`idempotency:consumer:order-created:{orderId}`) before processing.
 
 ## Prerequisites
 
