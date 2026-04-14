@@ -1,4 +1,5 @@
 using System.Text;
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
@@ -59,8 +60,26 @@ public sealed class SampleOrderConsumerWorker(
         BasicDeliverEventArgs ea,
         CancellationToken cancellationToken)
     {
+        var parentContext = MessagingTelemetry.ExtractTraceContext(ea.BasicProperties);
+
+        using var receiveActivity = MessagingTelemetry.ActivitySource.StartActivity(
+            "rabbitmq receive",
+            ActivityKind.Consumer,
+            parentContext.ActivityContext);
+
+        receiveActivity?.SetTag("messaging.system", "rabbitmq");
+        receiveActivity?.SetTag("messaging.destination.name", ea.Exchange);
+        receiveActivity?.SetTag("messaging.rabbitmq.routing_key", ea.RoutingKey);
+        receiveActivity?.SetTag("messaging.operation.name", "receive");
+        receiveActivity?.SetTag("messaging.message.id", ea.BasicProperties.MessageId);
+
         try
         {
+            using var processActivity = MessagingTelemetry.ActivitySource.StartActivity(
+                "handle order created",
+                ActivityKind.Internal);
+            processActivity?.SetTag("messaging.operation.name", "process");
+
             using var scope = scopeFactory.CreateScope();
             var idempotencyStore = scope.ServiceProvider.GetRequiredService<IIdempotencyStore>();
 
@@ -70,6 +89,7 @@ public sealed class SampleOrderConsumerWorker(
             if (orderEvent is null)
             {
                 logger.LogWarning("Received invalid OrderCreated payload. Acknowledging message.");
+                processActivity?.SetStatus(ActivityStatusCode.Error, "invalid-payload");
                 channel.BasicAck(ea.DeliveryTag, multiple: false);
                 return;
             }
@@ -81,6 +101,7 @@ public sealed class SampleOrderConsumerWorker(
                     "Skipping duplicate OrderCreated event for order {OrderId}. Idempotency key: {IdempotencyKey}",
                     orderEvent.OrderId,
                     idempotencyKey);
+                processActivity?.SetTag("idempotency.duplicate", true);
                 channel.BasicAck(ea.DeliveryTag, multiple: false);
                 return;
             }
@@ -91,15 +112,18 @@ public sealed class SampleOrderConsumerWorker(
                 orderEvent.CustomerEmail);
 
             await idempotencyStore.MarkAsProcessedAsync(idempotencyKey, ProcessedEventTtl, cancellationToken);
+            processActivity?.SetTag("idempotency.duplicate", false);
             channel.BasicAck(ea.DeliveryTag, multiple: false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            receiveActivity?.SetStatus(ActivityStatusCode.Error, "operation-cancelled");
             channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Failed to handle OrderCreated event. Message will be requeued.");
+            receiveActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
         }
     }
