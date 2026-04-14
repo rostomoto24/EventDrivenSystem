@@ -17,8 +17,8 @@ public sealed class CreateOrderCommandHandler(IAppDbContext dbContext) : IReques
             payload: JsonSerializer.Serialize(integrationEvent));
 
         await using var transaction = await dbContext.BeginTransactionAsync(cancellationToken);
-        await dbContext.Orders.AddAsync(order, cancellationToken);
-        await dbContext.OutboxMessages.AddAsync(outboxMessage, cancellationToken);
+        await dbContext.AddOrderAsync(order, cancellationToken);
+        await dbContext.AddOutboxMessageAsync(outboxMessage, cancellationToken);
         await dbContext.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
 
