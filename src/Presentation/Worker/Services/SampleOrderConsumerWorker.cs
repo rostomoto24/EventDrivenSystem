@@ -14,7 +14,9 @@ public sealed class SampleOrderConsumerWorker(
     IOptions<RabbitMqOptions> options,
     ILogger<SampleOrderConsumerWorker> logger) : BackgroundService
 {
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    private static readonly TimeSpan ProcessedEventTtl = TimeSpan.FromHours(24);
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var rabbitOptions = options.Value;
         var factory = new ConnectionFactory
@@ -25,15 +27,39 @@ public sealed class SampleOrderConsumerWorker(
             Password = rabbitOptions.Password
         };
 
-        var connection = factory.CreateConnection();
-        var channel = connection.CreateModel();
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
 
         channel.ExchangeDeclare(rabbitOptions.ExchangeName, ExchangeType.Direct, durable: true);
         channel.QueueDeclare(rabbitOptions.QueueName, durable: true, exclusive: false, autoDelete: false);
         channel.QueueBind(rabbitOptions.QueueName, rabbitOptions.ExchangeName, rabbitOptions.RoutingKey);
 
         var consumer = new EventingBasicConsumer(channel);
-        consumer.Received += async (_, ea) =>
+        consumer.Received += async (_, ea) => await HandleOrderCreatedAsync(channel, ea, stoppingToken);
+
+        channel.BasicConsume(rabbitOptions.QueueName, autoAck: false, consumer);
+
+        logger.LogInformation(
+            "Sample order consumer started. Queue: {QueueName}, RoutingKey: {RoutingKey}",
+            rabbitOptions.QueueName,
+            rabbitOptions.RoutingKey);
+
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            logger.LogInformation("Sample order consumer is stopping.");
+        }
+    }
+
+    private async Task HandleOrderCreatedAsync(
+        IModel channel,
+        BasicDeliverEventArgs ea,
+        CancellationToken cancellationToken)
+    {
+        try
         {
             using var scope = scopeFactory.CreateScope();
             var idempotencyStore = scope.ServiceProvider.GetRequiredService<IIdempotencyStore>();
@@ -43,24 +69,41 @@ public sealed class SampleOrderConsumerWorker(
 
             if (orderEvent is null)
             {
-                channel.BasicAck(ea.DeliveryTag, false);
+                logger.LogWarning("Received invalid OrderCreated payload. Acknowledging message.");
+                channel.BasicAck(ea.DeliveryTag, multiple: false);
                 return;
             }
 
-            var key = $"orders:processed:{orderEvent.OrderId}";
-            if (await idempotencyStore.HasBeenProcessedAsync(key, stoppingToken))
+            var idempotencyKey = BuildOrderCreatedIdempotencyKey(orderEvent.OrderId);
+            if (await idempotencyStore.HasBeenProcessedAsync(idempotencyKey, cancellationToken))
             {
-                logger.LogInformation("Skipping duplicate event for order {OrderId}", orderEvent.OrderId);
-                channel.BasicAck(ea.DeliveryTag, false);
+                logger.LogInformation(
+                    "Skipping duplicate OrderCreated event for order {OrderId}. Idempotency key: {IdempotencyKey}",
+                    orderEvent.OrderId,
+                    idempotencyKey);
+                channel.BasicAck(ea.DeliveryTag, multiple: false);
                 return;
             }
 
-            logger.LogInformation("Processing order {OrderId} for {CustomerEmail}", orderEvent.OrderId, orderEvent.CustomerEmail);
-            await idempotencyStore.MarkAsProcessedAsync(key, TimeSpan.FromHours(24), stoppingToken);
-            channel.BasicAck(ea.DeliveryTag, false);
-        };
+            logger.LogInformation(
+                "Handling OrderCreated event for order {OrderId} and customer {CustomerEmail}",
+                orderEvent.OrderId,
+                orderEvent.CustomerEmail);
 
-        channel.BasicConsume(rabbitOptions.QueueName, autoAck: false, consumer);
-        return Task.CompletedTask;
+            await idempotencyStore.MarkAsProcessedAsync(idempotencyKey, ProcessedEventTtl, cancellationToken);
+            channel.BasicAck(ea.DeliveryTag, multiple: false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to handle OrderCreated event. Message will be requeued.");
+            channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
+        }
     }
+
+    private static string BuildOrderCreatedIdempotencyKey(Guid orderId)
+        => $"idempotency:consumer:order-created:{orderId:N}";
 }
